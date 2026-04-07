@@ -144,7 +144,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=os.environ["DISCUSSION_GROUP_ID"],
             text=comment_text,
-            reply_to_message_id=post_id
+            reply_to_message_id=pending_posts[post_id].get("group_message_id", post_id)
         )
         await query.edit_message_text(f"✅ Опубликовано ({style}):\n\n{comment_text}")
         del pending_posts[post_id]
@@ -171,11 +171,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Нужен оригинальный текст поста — пока заглушка
         await query.edit_message_text("🔄 Функция перегенерации будет добавлена в следующей версии.")
 
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит форвард поста из канала в группу обсуждений и запоминает новый ID."""
+    msg = update.message
+    if not msg or not msg.forward_origin:
+        return
+    if hasattr(msg.forward_origin, 'chat') and str(msg.forward_origin.chat.id) == CHANNEL_ID:
+        channel_post_id = msg.forward_origin.message_id
+        if channel_post_id in pending_posts:
+            pending_posts[channel_post_id]["group_message_id"] = msg.message_id
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.Chat(int(os.environ["DISCUSSION_GROUP_ID"])), handle_group_message))
     app.run_polling()
 
 
