@@ -97,7 +97,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     pending_posts[post_id] = {"variants": variants, "post_id": post_id}
 
     # Отправляем варианты админу
-    text = f"📬 Новый пост в канале:\n\n{post_text[:200]}...\n\n─────────────\nВыбери стиль Марвина:"
+    variants_text = "\n\n".join([f"*{s}*\n{t}" for s, t in variants.items()])
+    text = f"📬 Новый пост в канале:\n\n{post_text[:200]}...\n\n─────────────\n{variants_text}\n\n─────────────\nВыбери стиль для публикации:"
     keyboard = []
     for style in STYLES:
         preview = variants[style][:40] + "..."
@@ -141,7 +142,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         comment_text = pending_posts[post_id]["variants"][style]
 
         await context.bot.send_message(
-            chat_id=CHANNEL_ID,
+            chat_id=os.environ["DISCUSSION_GROUP_ID"],
             text=comment_text,
             reply_to_message_id=post_id
         )
