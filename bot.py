@@ -70,7 +70,7 @@ def generate_variants(post_text: str) -> dict:
     variants = {}
     for style in STYLES:
         response = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-sonnet-4-5",
             max_tokens=200,
             system=MARVIN_SYSTEM_PROMPT,
             messages=[{
