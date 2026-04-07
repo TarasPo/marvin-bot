@@ -59,7 +59,7 @@ STYLES = [
     "Цитата себя",
 ]
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 # Хранилище: message_id поста → {style: text}
 pending_posts = {}
