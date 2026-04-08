@@ -268,9 +268,14 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 pending_posts[channel_post_id]["group_message_id"] = msg.message_id
         return
 
-    # Сообщение пользователя с упоминанием Марвина
+    # Сообщение пользователя — с упоминанием Марвина ИЛИ reply на сообщение бота
     text = msg.text or ""
-    if not is_marvin_mentioned(text):
+    is_reply_to_bot = (
+        msg.reply_to_message is not None and
+        msg.reply_to_message.from_user is not None and
+        msg.reply_to_message.from_user.id == context.bot.id
+    )
+    if not is_marvin_mentioned(text) and not is_reply_to_bot:
         return
 
     user_id = str(msg.from_user.id)
