@@ -27,9 +27,25 @@ published_posts = {}
 
 # --- Кризисные слова-детекторы ---
 CRISIS_KEYWORDS = [
-    "суицид", "не хочу жить", "конец жизни", "покончить", "убить себя",
-    "смысла нет", "незачем жить", "всё кончено", "умереть хочу",
-    "хочу умереть", "нет смысла жить", "жить не хочу", "покончу с собой"
+    # Прямые
+    "хочу умереть", "хочется умереть", "лучше бы меня не было",
+    "не хочу просыпаться", "устал жить", "устала жить",
+    "надоело жить", "незачем жить", "жить не хочу",
+    # Косвенные но однозначные
+    "всем будет лучше без меня", "никто не заметит",
+    "последний раз", "прощайте", "прощай всем",
+    "не вижу выхода", "выхода нет", "всё бессмысленно",
+    # Действия
+    "покончить с этим", "покончу с собой", "суицид",
+    "причиняю себе боль", "режу себя",
+]
+
+DISTRESS_KEYWORDS = [
+    "мне плохо", "не могу больше", "больше не могу", "сил больше нет",
+    "всё навалилось", "не справляюсь", "опустились руки",
+    "хочется плакать", "не останавливаясь плачу",
+    "паника", "паническая атака", "тревога не отпускает",
+    "депрессия", "дипрессия"
 ]
 
 # --- Google Sheets ---
@@ -145,6 +161,10 @@ def init_sheet_headers():
 def is_crisis(text: str) -> bool:
     text_lower = text.lower()
     return any(kw in text_lower for kw in CRISIS_KEYWORDS)
+
+def is_distress(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in DISTRESS_KEYWORDS)
 
 def is_marvin_mentioned(text: str) -> bool:
     return "марвин" in text.lower()
@@ -295,6 +315,21 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             text=f"⚠️ Возможный кризис\n@{username}: {text}\n\nОтветь вручную или нажми /crisis_reply {user_id} [текст]"
         )
         log_user_reply(group_id, user_id, username, text, "", "кризис")
+        return
+
+    # Дистресс — Марвин отвечает мягче, без сарказма
+    if is_distress(text):
+        distress_prompt = MARVIN_SYSTEM_PROMPT + "\n\nВАЖНО: сейчас человеку плохо. Не шути, не иронизируй. Отвечай коротко и по-человечески — признай что тебе тоже бывает плохо, что это проходит. Можно сказать что-то вроде 'я слышу тебя. мне тоже бывало плохо. это не навсегда.' Оставайся собой, но без сарказма."
+        response = client.messages.create(
+            model="claude-sonnet-4-5", max_tokens=200, system=distress_prompt,
+            messages=[{"role": "user", "content": f"Пользователь написал: {text}"}]
+        )
+        answer = response.content[0].text.strip()
+        await context.bot.send_message(
+            chat_id=group_id, text=answer,
+            reply_to_message_id=msg.message_id
+        )
+        log_user_reply(group_id, user_id, username, text, answer, "дистресс")
         return
 
     # Обычный ответ
