@@ -42,7 +42,7 @@ def log_to_sheets(post_text: str, style: str, comment_text: str, status: str, ch
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M"),
             channel_id,
-            post_text[:300],
+            post_text,
             post_hash,
             style,
             comment_text,
