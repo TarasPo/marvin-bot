@@ -190,6 +190,36 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if channel_post_id in pending_posts:
             pending_posts[channel_post_id]["group_message_id"] = msg.message_id
 
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит reply администратора на сообщение бота — предлагает опубликовать свой текст."""
+    msg = update.message
+    if not msg or str(msg.chat.id) != str(ADMIN_CHAT_ID):
+        return
+    if not msg.reply_to_message or msg.reply_to_message.from_user.id != context.bot.id:
+        return
+
+    custom_text = msg.text
+    if not custom_text:
+        return
+
+    # Ищем post_id в pending_posts — берём последний
+    if not pending_posts:
+        await msg.reply_text("Нет активных постов в памяти.")
+        return
+
+    post_id = list(pending_posts.keys())[-1]
+    post_data = pending_posts[post_id]
+    # Сохраняем кастомный текст
+    pending_posts[post_id]["custom_text"] = custom_text
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Опубликовать", callback_data=f"publish_custom:{post_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"back:{post_id}")]
+    ]
+    await msg.reply_text(
+        f"Твой вариант:\n\n{custom_text}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -206,6 +236,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(f"Стиль: {style}\n\n{comment_text}", reply_markup=InlineKeyboardMarkup(keyboard))
 
+    elif data.startswith("publish_custom:"):
+        post_id = int(data.split(":")[1])
+        post_data = pending_posts[post_id]
+        comment_text = post_data.get("custom_text", "")
+        channel_id = post_data.get("channel_id", list(CHANNELS.keys())[0])
+        discussion_group_id = CHANNELS[channel_id]
+        await context.bot.send_message(
+            chat_id=discussion_group_id,
+            text=comment_text,
+            reply_to_message_id=post_data.get("group_message_id", post_id)
+        )
+        log_to_sheets(post_data["post_text"], "Свой вариант", comment_text, True, channel_id)
+        await query.edit_message_text(f"✅ Опубликовано (свой вариант):\n\n{comment_text}")
+        del pending_posts[post_id]
+    
     elif data.startswith("publish:"):
         _, post_id, style = data.split(":", 2)
         post_id = int(post_id)
@@ -251,6 +296,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     group_ids = [int(gid) for gid in CHANNELS.values()]
     app.add_handler(MessageHandler(filters.Chat(chat_id=group_ids), handle_group_message))
+    app.add_handler(MessageHandler(filters.Chat(int(ADMIN_CHAT_ID)) & filters.REPLY, handle_admin_reply))
     app.run_polling()
 
 
