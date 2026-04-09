@@ -89,9 +89,9 @@ def log_user_reply(group_id: str, user_id: str, username: str, post_id: str, que
         sheet = get_sheet().worksheet("user_replies")
         sheet.append_row([
             datetime.now().strftime("%Y-%m-%d %H:%M"),
-            group_id, user_id, username, post_id,
+            group_id, user_id, username,
             question, answer, reply_type,
-            "", "", ""  # твой_комментарий, запрет, избранное
+            "", "", "", post_id  # твой_комментарий, запрет, избранное
         ])
     except Exception as e:
         logging.error(f"Ошибка записи user_reply: {e}")
@@ -172,7 +172,7 @@ def init_sheet_headers():
             spreadsheet.worksheet("user_replies")
         except gspread.exceptions.WorksheetNotFound:
             ws = spreadsheet.add_worksheet(title="user_replies", rows=1000, cols=11)
-            ws.append_row(["дата", "группа", "user_id", "username", "post_id", "вопрос", "ответ_марвина", "тип", "твой_комментарий", "запрет", "избранное"])
+            ws.append_row(["дата", "группа", "user_id", "username", "вопрос", "ответ_марвина", "тип", "твой_комментарий", "запрет", "избранное", "post_id"])
 
         # Лист config — промпт
         try:
@@ -353,8 +353,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     username = msg.from_user.username or msg.from_user.first_name or user_id
     group_id = str(msg.chat.id)
     # post_id — ID треда (сообщения-поста на которое отвечают)
-    post_id = str(msg.message_thread_id or msg.reply_to_message.message_id if msg.reply_to_message else "")
-
+    post_id = str(msg.message_thread_id or (msg.reply_to_message.message_id if msg.reply_to_message else ""))
+    
     # Кризис
     if is_crisis(text):
         pending_crisis[user_id] = {"text": text, "group_id": group_id, "message_id": msg.message_id, "username": username}
