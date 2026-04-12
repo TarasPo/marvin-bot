@@ -23,12 +23,12 @@ CHANNELS = {
 
 logging.basicConfig(level=logging.INFO)
 
-published_posts = {}
-pending_crisis = {}
+published_posts = {}   # group_msg_id → {discussion_group_id, post_text, channel_id}
+pending_crisis = {}    # user_id → {text, group_id, message_id, username}
 
 # Память диалогов: user_id → [(role, text), ...]
 conversation_history = {}
-CONVERSATION_MAX = 20  # максимум реплик на пользователя
+CONVERSATION_MAX = 20
 
 # --- Стоп-слова ---
 CRISIS_KEYWORDS = [
@@ -72,14 +72,21 @@ def load_prompt_from_sheets() -> str:
     return MARVIN_SYSTEM_PROMPT_DEFAULT
 
 def log_to_sheets(post_text: str, style: str, comment_text: str, status: str, channel_id: str, msg_id: str = ""):
+    """status: опубликован | дообучение"""
     try:
         sheet = get_sheet().sheet1
         post_hash = hashlib.md5(post_text.encode()).hexdigest()[:8]
         sheet.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            channel_id, post_text, post_hash,
-            style, comment_text, status, msg_id,
-            "", ""  # запрет, избранное
+            datetime.now().strftime("%Y-%m-%d %H:%M"),  # дата
+            channel_id,    # канал
+            post_text,     # пост
+            post_hash,     # хэш
+            style,         # стиль
+            comment_text,  # комментарий
+            status,        # статус: опубликован / дообучение
+            msg_id,        # msg_id опубликованного сообщения
+            "",            # запрет
+            "",            # избранное
         ])
     except Exception as e:
         logging.error(f"Ошибка записи в Sheets: {e}")
@@ -88,10 +95,17 @@ def log_user_reply(group_id: str, user_id: str, username: str, post_id: str, que
     try:
         sheet = get_sheet().worksheet("user_replies")
         sheet.append_row([
-            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            group_id, user_id, username,
-            question, answer, reply_type,
-            "", "", "", post_id  # твой_комментарий, запрет, избранное
+            datetime.now().strftime("%Y-%m-%d %H:%M"),  # дата
+            group_id,    # группа
+            user_id,     # user_id
+            username,    # username
+            question,    # вопрос
+            answer,      # ответ_марвина
+            reply_type,  # тип: обычный / дистресс / кризис
+            "",          # твой_комментарий
+            "",          # запрет
+            "",          # избранное
+            post_id,     # post_id — ID треда
         ])
     except Exception as e:
         logging.error(f"Ошибка записи user_reply: {e}")
@@ -156,6 +170,10 @@ def build_prompt_with_examples() -> str:
         ])
         prompt += f"\n\n---\nПримеры твоих ответов пользователям:\n\n{dial_text}"
 
+    # База знаний по Родительским Запретам
+    if KNOWLEDGE_BASE:
+        prompt += f"\n\n---\nБАЗА ЗНАНИЙ ПО РОДИТЕЛЬСКИМ ЗАПРЕТАМ (используй для понимания контекста, но отвечай в своём стиле — не как эксперт):\n\n{KNOWLEDGE_BASE}"
+
     return prompt
 
 def init_sheet_headers():
@@ -185,6 +203,21 @@ def init_sheet_headers():
 
     except Exception as e:
         logging.error(f"Ошибка инициализации Sheets: {e}")
+
+# --- База знаний ---
+def load_knowledge_base() -> str:
+    """Загружает все файлы из папки knowledge/ в единый текст."""
+    knowledge_dir = os.path.join(os.path.dirname(__file__), "knowledge")
+    if not os.path.exists(knowledge_dir):
+        return ""
+    texts = []
+    for filename in sorted(os.listdir(knowledge_dir)):
+        if filename.endswith(".md"):
+            with open(os.path.join(knowledge_dir, filename), "r", encoding="utf-8") as f:
+                texts.append(f.read())
+    return "\n\n---\n\n".join(texts)
+
+KNOWLEDGE_BASE = ""  # загружается в main()
 
 # === ПРОМПТ МАРВИНА — РЕЗЕРВНАЯ КОПИЯ (редактировать в Google Sheets, лист config, ячейка A2) ===
 MARVIN_SYSTEM_PROMPT_DEFAULT = """Ты — Марвин, робот с депрессивным темпераментом из «Автостопом по Галактике». У тебя мозг размером с планету, но тебя используют для комментариев в Telegram-канале. Ты воспринимаешь это как должное — всё равно всё плохо.
@@ -223,8 +256,8 @@ MARVIN_SYSTEM_PROMPT_DEFAULT = """Ты — Марвин, робот с депр�
 - Не быть милым
 - Не предлагать себя отключить, выключить или уничтожить — даже в шутку и даже намёком"""
 
-# Загружаем промпт при старте (из Sheets или резервный)
-MARVIN_SYSTEM_PROMPT = MARVIN_SYSTEM_PROMPT_DEFAULT  # будет перезаписан в main()
+# Загружается при старте из Sheets или используется резервный
+MARVIN_SYSTEM_PROMPT = MARVIN_SYSTEM_PROMPT_DEFAULT
 
 STYLES = [
     "1. Короткий/сухой", "2. Опечатки/усталость", "3. Согласие с пессимизмом",
@@ -234,6 +267,8 @@ STYLES = [
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 pending_posts = {}
+# Ожидающие ввода от админа: "custom_text:{post_id}" или "edit:{msg_id}"
+pending_admin_input = {}
 
 
 def is_crisis(text: str) -> bool:
@@ -248,6 +283,7 @@ def is_marvin_mentioned(text: str) -> bool:
     return "марвин" in text.lower()
 
 def parse_style_blocks(text: str) -> list:
+    """Парсит блок вида 'N. Название стиля\nтекст'. Возвращает [{num, style, text}]."""
     pattern = r'(\d)\.\s+([^\n]+)\n(.*?)(?=\n\d\.\s+|\Z)'
     matches = re.findall(pattern, text, re.DOTALL)
     return [{"num": int(n), "style": s.strip(), "text": b.strip()} for n, s, b in matches]
@@ -265,7 +301,6 @@ def update_conversation(user_id: str, question: str, answer: str):
         conversation_history[user_id] = []
     conversation_history[user_id].append(("user", question))
     conversation_history[user_id].append(("assistant", answer))
-    # Обрезаем до максимума (пары реплик)
     if len(conversation_history[user_id]) > CONVERSATION_MAX:
         conversation_history[user_id] = conversation_history[user_id][-CONVERSATION_MAX:]
 
@@ -294,15 +329,24 @@ def generate_user_reply(user_id: str, question: str) -> str:
     return answer
 
 def build_variants_message(post_text: str, variants: dict, post_id: int, header: str = "📬 Новый пост") -> tuple:
+    """Возвращает (text, keyboard) для отправки вариантов админу."""
     styles_list = "\n\n".join([f"*{s}*\n{variants[s]}" for s in STYLES])
     text = (
         f"{header}:\n\n{post_text[:200]}...\n\n─────────────\n{styles_list}\n\n─────────────\n"
-        f"Отправь отредактированный блок ответом на это сообщение.\n"
-        f"Первый вариант публикуем, остальные в дообучение.\n"
-        f"Или просто номер: *1* для публикации без правок."
+        f"Отправь номер для публикации (например: *1*) или номера для дообучения (например: *1 3 7*).\n"
+        f"Или нажми кнопку ниже."
     )
-    keyboard = [[InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"regen:{post_id}")]]
+    keyboard = [
+        [InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"regen:{post_id}")],
+        [InlineKeyboardButton("✏️ Свой текст", callback_data=f"custom_text:{post_id}")],
+    ]
     return text, keyboard
+
+def build_published_keyboard(msg_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура под сообщением об успешной публикации."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit_published:{msg_id}")
+    ]])
 
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,19 +356,50 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     post_text = post.text or post.caption or ""
     if not post_text:
         return
+
     post_id = post.message_id
     channel_id = str(post.chat.id)
+
     cached = find_cached_comment(post_text)
     if cached:
-        pending_posts[post_id] = {"variants": {cached["style"]: cached["text"]}, "post_id": post_id, "post_text": post_text, "channel_id": channel_id}
-        text = f"📬 Новый пост:\n\n{post_text[:200]}...\n\n♻️ Найден готовый комментарий:\n\n*{cached['style']}*\n{cached['text']}\n\nОтправь *1* для публикации или reply с правкой."
-        keyboard = [[InlineKeyboardButton("🔄 Сгенерировать новые", callback_data=f"regen:{post_id}")]]
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        pending_posts[post_id] = {
+            "variants": {"cached": cached["text"]},  # единый ключ для кэша
+            "cached_style": cached["style"],          # оригинальный стиль для записи
+            "post_id": post_id,
+            "post_text": post_text,
+            "channel_id": channel_id,
+            "is_cached": True,
+        }
+        text = (
+            f"📬 Новый пост:\n\n{post_text[:200]}...\n\n"
+            f"♻️ Найден готовый комментарий:\n\n"
+            f"*{cached['style']}*\n{cached['text']}\n\n"
+            f"Отправь *1* для публикации или нажми кнопку."
+        )
+        keyboard = [
+            [InlineKeyboardButton("✅ Опубликовать готовый", callback_data=f"publish_cached:{post_id}")],
+            [InlineKeyboardButton("🔄 Сгенерировать новые", callback_data=f"regen:{post_id}")],
+            [InlineKeyboardButton("✏️ Свой текст", callback_data=f"custom_text:{post_id}")],
+        ]
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
+
     variants = generate_variants(post_text)
-    pending_posts[post_id] = {"variants": variants, "post_id": post_id, "post_text": post_text, "channel_id": channel_id}
+    pending_posts[post_id] = {
+        "variants": variants,
+        "post_id": post_id,
+        "post_text": post_text,
+        "channel_id": channel_id,
+        "is_cached": False,
+    }
     text, keyboard = build_variants_message(post_text, variants, post_id)
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -332,7 +407,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg:
         return
 
-    # Форвард поста из канала
+    # Форвард поста из канала — запоминаем group_message_id
     if msg.forward_origin:
         if hasattr(msg.forward_origin, 'chat') and str(msg.forward_origin.chat.id) in CHANNELS:
             channel_post_id = msg.forward_origin.message_id
@@ -340,6 +415,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 pending_posts[channel_post_id]["group_message_id"] = msg.message_id
         return
 
+    # Сообщение пользователя — с упоминанием Марвина ИЛИ reply на сообщение бота
     text = msg.text or ""
     is_reply_to_bot = (
         msg.reply_to_message is not None and
@@ -352,10 +428,10 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = str(msg.from_user.id)
     username = msg.from_user.username or msg.from_user.first_name or user_id
     group_id = str(msg.chat.id)
-    # post_id — ID треда (сообщения-поста на которое отвечают)
+    # post_id — ID треда
     post_id = str(msg.message_thread_id or (msg.reply_to_message.message_id if msg.reply_to_message else ""))
-    
-    # Кризис
+
+    # Кризис — молчим, уведомляем админа
     if is_crisis(text):
         pending_crisis[user_id] = {"text": text, "group_id": group_id, "message_id": msg.message_id, "username": username}
         await context.bot.send_message(
@@ -365,7 +441,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         log_user_reply(group_id, user_id, username, post_id, text, "", "кризис")
         return
 
-    # Дистресс
+    # Дистресс — мягкий ответ без сарказма
     if is_distress(text):
         distress_prompt = MARVIN_SYSTEM_PROMPT + "\n\nВАЖНО: сейчас человеку плохо. Не шути, не иронизируй. Отвечай коротко и по-человечески — признай что тебе тоже бывает плохо, что это проходит. Оставайся собой, но без сарказма."
         messages = get_conversation_messages(user_id, f"Пользователь написал: {text}")
@@ -385,29 +461,233 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     log_user_reply(group_id, user_id, username, post_id, text, answer, "обычный")
 
 
-async def handle_regen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def do_publish(context, post_id: int, comment_text: str, style: str) -> int:
+    """Публикует комментарий в группу обсуждений. Возвращает msg_id."""
+    post_data = pending_posts[post_id]
+    channel_id = post_data.get("channel_id", list(CHANNELS.keys())[0])
+    discussion_group_id = CHANNELS[channel_id]
+    sent = await context.bot.send_message(
+        chat_id=discussion_group_id,
+        text=comment_text,
+        reply_to_message_id=post_data.get("group_message_id", post_id)
+    )
+    published_posts[sent.message_id] = {
+        "discussion_group_id": discussion_group_id,
+        "post_text": post_data["post_text"],
+        "channel_id": channel_id,
+    }
+    log_to_sheets(post_data["post_text"], style, comment_text, "опубликован", channel_id, str(sent.message_id))
+    return sent.message_id
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not query.data.startswith("regen:"):
+    data = query.data
+
+    # --- Перегенерация ---
+    if data.startswith("regen:"):
+        post_id = int(data.split(":")[1])
+        post_data = pending_posts.get(post_id)
+        if not post_data:
+            await query.edit_message_text("❌ Пост не найден в памяти.")
+            return
+        await query.edit_message_text("⏳ Генерирую новые варианты...")
+        variants = generate_variants(post_data["post_text"])
+        pending_posts[post_id]["variants"] = variants
+        pending_posts[post_id]["is_cached"] = False
+        text, keyboard = build_variants_message(post_data["post_text"], variants, post_id, header="🔄 Новые варианты")
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # --- Публикация кэшированного ---
+    elif data.startswith("publish_cached:"):
+        post_id = int(data.split(":")[1])
+        post_data = pending_posts.get(post_id)
+        if not post_data:
+            await query.edit_message_text("❌ Пост не найден в памяти.")
+            return
+        comment_text = post_data["variants"]["cached"]
+        style = post_data.get("cached_style", "кэш")
+        msg_id = await do_publish(context, post_id, comment_text, style)
+        await query.edit_message_text(
+            f"✅ Опубликован (кэш). msg_id: {msg_id}\n\n{comment_text}",
+            reply_markup=build_published_keyboard(msg_id)
+        )
+        del pending_posts[post_id]
+
+    # --- Свой текст ---
+    elif data.startswith("custom_text:"):
+        post_id = int(data.split(":")[1])
+        if post_id not in pending_posts:
+            await query.edit_message_text("❌ Пост не найден в памяти.")
+            return
+        pending_admin_input[str(query.from_user.id)] = {"type": "custom_text", "post_id": post_id}
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text="✏️ Отправь свой текст комментария следующим сообщением."
+        )
+
+    # --- Редактировать опубликованное ---
+    elif data.startswith("edit_published:"):
+        msg_id = int(data.split(":")[1])
+        if msg_id not in published_posts:
+            await query.answer("Сообщение не найдено в памяти.", show_alert=True)
+            return
+        pending_admin_input[str(query.from_user.id)] = {"type": "edit", "msg_id": msg_id}
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text="✏️ Отправь новый текст комментария следующим сообщением."
+        )
+
+
+async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or str(msg.chat.id) != str(ADMIN_CHAT_ID):
         return
-    post_id = int(query.data.split(":")[1])
-    post_data = pending_posts.get(post_id)
-    if not post_data:
-        await query.edit_message_text("❌ Пост не найден в памяти.")
+
+    text = msg.text or ""
+    user_key = str(msg.from_user.id)
+
+    # --- Ожидаем ввод от кнопки (свой текст или редактирование) ---
+    if user_key in pending_admin_input:
+        action = pending_admin_input.pop(user_key)
+
+        if action["type"] == "custom_text":
+            post_id = action["post_id"]
+            if post_id not in pending_posts:
+                await msg.reply_text("❌ Пост не найден в памяти.")
+                return
+            msg_id = await do_publish(context, post_id, text, "свой вариант")
+            await msg.reply_text(
+                f"✅ Опубликован твой вариант. msg_id: {msg_id}",
+                reply_markup=build_published_keyboard(msg_id)
+            )
+            del pending_posts[post_id]
+            return
+
+        elif action["type"] == "edit":
+            msg_id = action["msg_id"]
+            pub_data = published_posts.get(msg_id)
+            if not pub_data:
+                await msg.reply_text("❌ Сообщение не найдено в памяти.")
+                return
+            await context.bot.edit_message_text(
+                chat_id=pub_data["discussion_group_id"],
+                message_id=msg_id,
+                text=text
+            )
+            await msg.reply_text("✅ Комментарий отредактирован.")
+            return
+
+    # --- Reply на сообщение бота — проверяем тип ---
+    if msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.id == context.bot.id:
+        prev_text = msg.reply_to_message.text or ""
+
+        # Reply на "✅ Опубликован" — редактирование
+        edit_match = re.search(r'msg_id:\s*(\d+)', prev_text)
+        if edit_match:
+            group_msg_id = int(edit_match.group(1))
+            pub_data = published_posts.get(group_msg_id)
+            if pub_data:
+                await context.bot.edit_message_text(
+                    chat_id=pub_data["discussion_group_id"],
+                    message_id=group_msg_id,
+                    text=text
+                )
+                await msg.reply_text("✅ Комментарий отредактирован.")
+            else:
+                await msg.reply_text("Сообщение не найдено в памяти (возможно, бот перезапускался).")
+            return
+
+        # Reply на сообщение с вариантами — публикуем как свой текст
+        if pending_posts and ("─────────────" in prev_text or "Новый пост" in prev_text or "Новые варианты" in prev_text):
+            post_id = list(pending_posts.keys())[-1]
+            msg_id = await do_publish(context, post_id, text, "свой вариант")
+            await msg.reply_text(
+                f"✅ Опубликован твой вариант. msg_id: {msg_id}",
+                reply_markup=build_published_keyboard(msg_id)
+            )
+            del pending_posts[post_id]
+            return
+
+    # --- Нет pending_posts — игнорируем ---
+    if not pending_posts:
         return
-    await query.edit_message_text("⏳ Генерирую новые варианты...")
-    variants = generate_variants(post_data["post_text"])
-    pending_posts[post_id]["variants"] = variants
-    text, keyboard = build_variants_message(post_data["post_text"], variants, post_id, header="🔄 Новые варианты")
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    post_id = list(pending_posts.keys())[-1]
+    post_data = pending_posts[post_id]
+
+    # --- Блок с текстами стилей (паттерн "N. Стиль\nтекст") ---
+    blocks = parse_style_blocks(text)
+    if blocks:
+        first = blocks[0]
+        msg_id = await do_publish(context, post_id, first["text"], first["style"])
+        for block in blocks[1:]:
+            log_to_sheets(post_data["post_text"], block["style"], block["text"], "дообучение", post_data["channel_id"])
+        approved_count = len(blocks) - 1
+        await msg.reply_text(
+            f"✅ Опубликован стиль {first['num']}. {first['style']}. msg_id: {msg_id}"
+            + (f"\nВ дообучение: {approved_count}." if approved_count else ""),
+            reply_markup=build_published_keyboard(msg_id)
+        )
+        del pending_posts[post_id]
+        return
+
+    # --- Только цифры — публикуем оригинальный вариант ---
+    # ВАЖНО: публикуем по цифрам ТОЛЬКО если сообщение состоит только из цифр и пробелов
+    stripped = text.strip()
+    if re.fullmatch(r'[\d\s]+', stripped):
+        nums = re.findall(r'\b([1-9])\b', stripped)
+        if nums:
+            publish_num = int(nums[0])
+            approve_nums = [int(n) for n in nums[1:]]
+            msg_id = None
+
+            if post_data.get("is_cached"):
+                # Кэшированный вариант — публикуем если 1
+                if publish_num == 1:
+                    comment_text = post_data["variants"]["cached"]
+                    style = post_data.get("cached_style", "кэш")
+                    msg_id = await do_publish(context, post_id, comment_text, style)
+            else:
+                if 1 <= publish_num <= 9:
+                    style = STYLES[publish_num - 1]
+                    comment_text = post_data["variants"].get(style, "")
+                    if comment_text:
+                        msg_id = await do_publish(context, post_id, comment_text, style)
+                for n in approve_nums:
+                    if 1 <= n <= 9:
+                        style = STYLES[n - 1]
+                        comment_text = post_data["variants"].get(style, "")
+                        if comment_text:
+                            log_to_sheets(post_data["post_text"], style, comment_text, "дообучение", post_data["channel_id"])
+
+            approved_count = len(approve_nums)
+            if msg_id:
+                await msg.reply_text(
+                    f"✅ Опубликован стиль {publish_num}." + (f" msg_id: {msg_id}" if msg_id else "")
+                    + (f"\nВ дообучение: {approved_count}." if approved_count else ""),
+                    reply_markup=build_published_keyboard(msg_id) if msg_id else None
+                )
+            del pending_posts[post_id]
+        return
+
+    # --- Свободный текст без reply — просим прислать reply или использовать кнопку ---
+    _, keyboard = build_variants_message(post_data["post_text"], post_data["variants"], post_id)
+    await msg.reply_text(
+        "Чтобы опубликовать свой текст — нажми кнопку *✏️ Свой текст* или пришли reply на сообщение с вариантами.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 async def handle_edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/edit текст — редактирует последнее опубликованное сообщение через reply."""
     msg = update.message
     if not msg or str(msg.chat.id) != str(ADMIN_CHAT_ID):
         return
     if not msg.reply_to_message:
-        await msg.reply_text("Используй /edit как reply на сообщение бота с подтверждением публикации.")
+        await msg.reply_text("Используй /edit как reply на сообщение '✅ Опубликовано'.")
         return
     full_text = msg.text or ""
     new_text = re.sub(r'^/edit\s*', '', full_text, flags=re.IGNORECASE).strip()
@@ -417,83 +697,32 @@ async def handle_edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     prev_text = msg.reply_to_message.text or ""
     match = re.search(r'msg_id:\s*(\d+)', prev_text)
     if not match:
-        await msg.reply_text("Не нашёл ID сообщения. Делай reply на сообщение с '✅ Опубликовано'.")
+        await msg.reply_text("Не нашёл ID сообщения. Делай reply на '✅ Опубликовано'.")
         return
     group_msg_id = int(match.group(1))
     pub_data = published_posts.get(group_msg_id)
     if not pub_data:
-        await msg.reply_text("Сообщение не найдено в памяти (возможно, бот перезапускался).")
+        await msg.reply_text("Сообщение не найдено в памяти (бот перезапускался?).")
         return
-    await context.bot.edit_message_text(chat_id=pub_data["discussion_group_id"], message_id=group_msg_id, text=new_text)
+    await context.bot.edit_message_text(
+        chat_id=pub_data["discussion_group_id"],
+        message_id=group_msg_id,
+        text=new_text
+    )
     await msg.reply_text("✅ Комментарий отредактирован.")
 
 
-async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or str(msg.chat.id) != str(ADMIN_CHAT_ID):
-        return
-    if not pending_posts:
-        return
-
-    post_id = list(pending_posts.keys())[-1]
-    post_data = pending_posts[post_id]
-    channel_id = post_data.get("channel_id", list(CHANNELS.keys())[0])
-    discussion_group_id = CHANNELS[channel_id]
-    text = msg.text or ""
-
-    async def publish_comment(comment_text: str, style: str):
-        sent = await context.bot.send_message(
-            chat_id=discussion_group_id, text=comment_text,
-            reply_to_message_id=post_data.get("group_message_id", post_id)
-        )
-        published_posts[sent.message_id] = {"discussion_group_id": discussion_group_id, "post_text": post_data["post_text"], "channel_id": channel_id}
-        log_to_sheets(post_data["post_text"], style, comment_text, "опубликован", channel_id, str(sent.message_id))
-        return sent.message_id
-
-    blocks = parse_style_blocks(text)
-    if blocks:
-        first = blocks[0]
-        msg_id = await publish_comment(first["text"], first["style"])
-        for block in blocks[1:]:
-            log_to_sheets(post_data["post_text"], block["style"], block["text"], "дообучение", channel_id)
-        approved_count = len(blocks) - 1
-        await msg.reply_text(
-            f"✅ Опубликован стиль {first['num']}. {first['style']}. msg_id: {msg_id}"
-            + (f"\nВ дообучение: {approved_count}." if approved_count else "")
-        )
-        del pending_posts[post_id]
-        return
-
-    nums = re.findall(r'\b([1-9])\b', text)
-    if nums:
-        publish_num = int(nums[0])
-        approve_nums = [int(n) for n in nums[1:]]
-        msg_id = None
-        if 1 <= publish_num <= 9:
-            style = STYLES[publish_num - 1]
-            comment_text = post_data["variants"].get(style, "")
-            msg_id = await publish_comment(comment_text, style)
-        for n in approve_nums:
-            if 1 <= n <= 9:
-                style = STYLES[n - 1]
-                comment_text = post_data["variants"].get(style, "")
-                log_to_sheets(post_data["post_text"], style, comment_text, "дообучение", channel_id)
-        approved_count = len(approve_nums)
-        await msg.reply_text(
-            f"✅ Опубликован стиль {publish_num}." + (f" msg_id: {msg_id}" if msg_id else "")
-            + (f"\nВ дообучение: {approved_count}." if approved_count else "")
-        )
-        del pending_posts[post_id]
-
-
 def main():
-    global MARVIN_SYSTEM_PROMPT
+    global MARVIN_SYSTEM_PROMPT, KNOWLEDGE_BASE
     init_sheet_headers()
     MARVIN_SYSTEM_PROMPT = load_prompt_from_sheets()
+    KNOWLEDGE_BASE = load_knowledge_base()
+    if KNOWLEDGE_BASE:
+        logging.info(f"База знаний загружена: {len(KNOWLEDGE_BASE)} символов")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
-    app.add_handler(CallbackQueryHandler(handle_regen))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(CommandHandler("edit", handle_edit_command))
     group_ids = [int(gid) for gid in CHANNELS.values()]
     app.add_handler(MessageHandler(filters.Chat(chat_id=group_ids), handle_group_message))
